@@ -170,6 +170,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "mcp", extra = ["cli"] },
     { name = "ollama" },
+    { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "uvicorn" },
 ]
@@ -179,6 +180,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.12" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.9.2" },
     { name = "ollama", specifier = ">=0.5.1" },
+    { name = "pydantic", specifier = ">=2.11.5" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
     { name = "uvicorn", specifier = ">=0.34.3" },
 ]
