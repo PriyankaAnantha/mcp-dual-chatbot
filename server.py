@@ -24,6 +24,7 @@ except Exception as e:
     name="base_chat",
     description="Sends a message to a selected LLM and gets a response."
 )
+
 async def base_chat_tool(user_message: str, model_name: str = BaseChatInput.model_fields['model_name'].default): 
     start_time = time.time()
     print(f"MCP_SERVER: [{start_time:.2f}] Received base_chat for model '{model_name}': '{user_message[:50]}...'")
