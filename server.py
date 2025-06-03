@@ -1,93 +1,90 @@
 import asyncio
 from mcp.server.fastmcp import FastMCP
-import ollama # ollama.AsyncClient will be used
+import ollama
 from pydantic import BaseModel, Field
+import time
 
 # --- Pydantic models for input schemas ---
 class BaseChatInput(BaseModel):
     user_message: str = Field(description="The message from the user.")
-    model_name: str = Field(default="llama3.2", description="The Ollama model to use (e.g., 'llama3.2', 'mistral').")
-    # Add llama3.2 instead of mistral as default, assuming you have it
-
+    model_name: str = Field(default="mistral", description="The Ollama model to use (e.g., 'mistral', 'llama3').")
 # --- End Pydantic models ---
 
 # 1. Initialize FastMCP server
 mcp = FastMCP(name="DualChatbotPlatform_MCP")
 
-# Initialize the Ollama async client (for streaming)
-ollama_async_client = ollama.AsyncClient()
+try:
+    ollama_async_client = ollama.AsyncClient()
+except Exception as e:
+    print(f"WARNING: Could not initialize Ollama AsyncClient. Ensure Ollama is running. Error: {e}")
+    ollama_async_client = None
 
 # 2. Define the base_chat MCP Tool (Streaming)
 @mcp.tool(
-    name="base_chat", # Renamed for clarity in our plan
-    description="Sends a message to the base LLM and gets a streaming response.",
-    input_schema=BaseChatInput
+    name="base_chat",
+    description="Sends a message to a selected LLM and gets a response."
 )
-async def base_chat_tool(user_message: str, model_name: str = "llama3.2"): # Function is now async
-    """
-    Handles a chat request to the base LLM and streams the response.
-    This will power the left-side (non-RAG) bot.
-    """
-    print(f"Received base_chat request for model '{model_name}': {user_message}")
+async def base_chat_tool(user_message: str, model_name: str = BaseChatInput.model_fields['model_name'].default): 
+    start_time = time.time()
+    print(f"MCP_SERVER: [{start_time:.2f}] Received base_chat for model '{model_name}': '{user_message[:50]}...'")
     
+    if not ollama_async_client:
+        error_msg = "Ollama client not initialized."
+        print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] ERROR - {error_msg}")
+        return f"[ERROR: {error_msg}]"
+
+    full_response_content = []
     try:
-        # Stream the response from Ollama using the async client
+        print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] Calling Ollama model '{model_name}'...")
+        ollama_call_start_time = time.time()
+        
+        first_chunk_received_time = None
+
         async for part in await ollama_async_client.chat(
             model=model_name,
             messages=[{'role': 'user', 'content': user_message}],
             stream=True
         ):
-            if part['message']['content']:
+            if first_chunk_received_time is None:
+                first_chunk_received_time = time.time()
+                print(f"MCP_SERVER: [{first_chunk_received_time - start_time:.2f}s] First chunk from Ollama after {first_chunk_received_time - ollama_call_start_time:.2f}s.")
+
+            if part.get('message', {}).get('content'):
                 chunk = part['message']['content']
-                # FastMCP should handle yielding strings as text stream parts
-                yield chunk 
+                full_response_content.append(chunk)
             
             if part.get('done'):
-                print(f"Base_chat stream finished for: {user_message[:30]}...")
-                break
+                if part.get('done_reason') == 'load_model':
+                    print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] Ollama is loading model '{model_name}'...")
+                else:
+                    print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] Base_chat Ollama stream finished.")
+                    break
         
+        ollama_call_duration = time.time() - ollama_call_start_time
+        print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] Ollama call took {ollama_call_duration:.2f}s.")
+        
+        final_response = "".join(full_response_content)
+        # print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] Final collected response: {final_response[:100]}...")
+        
+        total_tool_duration = time.time() - start_time
+        print(f"MCP_SERVER: [{total_tool_duration:.2f}s] Returning final response. Length: {len(final_response)}")
+        return final_response 
+        
+    except ollama.ResponseError as e:
+        # ... (error handling) ...
+        error_message = f"Ollama API error: {e.error} (Status: {e.status_code})"
+        print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] ERROR - {error_message}")
+        return f"[ERROR: {error_message}]"
     except Exception as e:
         error_message = f"Error in base_chat_tool with Ollama: {e}"
-        print(error_message)
-        yield f"[ERROR: {error_message}]" # Stream the error back
+        print(f"MCP_SERVER: [{time.time() - start_time:.2f}s] ERROR - {error_message}")
+        return f"[ERROR: {error_message}]"
 
-@mcp.tool()
-def list_ollama_models() -> str: # This tool can remain synchronous
-    """Get a list of available Ollama models."""
-    try:
-        # Use the synchronous client for this simple, non-streaming task
-        models_info = ollama.list() 
-        model_names = [model['name'] for model in models_info['models']]
-        if not model_names:
-            return "No Ollama models found. Make sure Ollama is running and models are pulled."
-        return f"Available models: {', '.join(model_names)}"
-    except Exception as e:
-        # Catch potential connection errors if Ollama isn't running
-        return f"Error listing Ollama models: {str(e)}. Is Ollama running?"
-
-# We will build the RAG chat tool and dual display logic later.
-# For now, the 'dual_model_chat' you had can be kept for experimentation
-# or removed if focusing only on the left/right bot plan.
-# Let's keep it for now as it doesn't interfere.
-@mcp.tool()
-def dual_model_chat(message: str, model1: str = "llama3.2", model2: str = "llama3.2") -> str:
-    """Get responses from two different models and compare them (non-streaming)."""
-    try:
-        response1 = ollama.chat(model=model1, messages=[{'role': 'user', 'content': message}])
-        response2 = ollama.chat(model=model2, messages=[{'role': 'user', 'content': message}])
-        
-        result = f"Model {model1} says:\n{response1['message']['content']}\n\n"
-        result += f"Model {model2} says:\n{response2['message']['content']}"
-        return result
-    except Exception as e:
-        return f"Error in dual_model_chat: {str(e)}"
 
 # 3. Main execution block
 if __name__ == "__main__":
-    print("Starting MCP Server for Dual Chatbot Platform...")
+    print("Starting MCP Server for Dual Chatbot Platform (FastMCP)...")
     try:
-        # mcp.run() for FastMCP is synchronous at the top level,
-        # but it can serve async tools.
         mcp.run(transport='stdio')
     except KeyboardInterrupt:
         print("\nMCP Server shutting down...")
