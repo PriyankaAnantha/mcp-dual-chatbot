@@ -2,146 +2,427 @@ import asyncio
 from mcp.server.fastmcp import FastMCP
 import ollama
 import logging
+import json
+from typing import AsyncGenerator, Optional
 
-# Minimal logging
+# Minimal logging to avoid MCP protocol interference
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger("DualChatbotMCP")
 
 # Initialize FastMCP server
 mcp = FastMCP(name="DualChatbotPlatform_MCP")
 
-# Global Ollama client
+# Global Ollama client state
 ollama_client = None
 ollama_available = False
+default_model = "mistral"
 
 async def check_ollama():
-    """Check if Ollama is available and working"""
+    """Check if Ollama is available and initialize client"""
     global ollama_client, ollama_available
     
     try:
-        # Create client
         ollama_client = ollama.AsyncClient()
-        
-        # Quick test - just try to list models with short timeout
-        models = await asyncio.wait_for(ollama_client.list(), timeout=3.0)
+        # Test connection with a quick model list call
+        await asyncio.wait_for(ollama_client.list(), timeout=5.0)
         ollama_available = True
+        logger.info("✅ Ollama connection established")
         return True
-    except:
+    except asyncio.TimeoutError:
+        logger.error("❌ Ollama connection timeout - service may be slow")
         ollama_available = False
         return False
+    except Exception as e:
+        logger.error(f"❌ Ollama connection failed: {e}")
+        ollama_available = False
+        return False
+
+async def ensure_ollama_available():
+    """Ensure Ollama is available, attempt reconnection if needed"""
+    if not ollama_available:
+        return await check_ollama()
+    return True
 
 @mcp.tool(
     name="test_connection",
     description="Test if the MCP server is working properly"
 )
 async def test_connection():
-    """Simple test tool to verify MCP is working"""
-    return "MCP server is working! Connection successful."
+    """Simple test tool to verify MCP server connectivity"""
+    status = await check_ollama()
+    if status:
+        return "✅ MCP server is working! Ollama connection successful."
+    else:
+        return "⚠️ MCP server working, but Ollama connection failed. Is Ollama running?"
 
 @mcp.tool(
     name="list_models", 
-    description="List available Ollama models"
+    description="List all available Ollama models for selection"
 )
 async def list_models():
-    """List available Ollama models"""
-    if not ollama_available:
-        if not await check_ollama():
-            return "ERROR: Ollama not available. Is it running on localhost:11434?"
+    """List all available Ollama models that can be used for chat"""
+    if not await ensure_ollama_available():
+        return {
+            "status": "error",
+            "message": "❌ ERROR: Ollama not available. Please ensure Ollama service is running:\n" +
+                      "- Windows: Start Ollama desktop app or run 'ollama serve'\n" +
+                      "- Linux: Run 'sudo systemctl start ollama' or 'ollama serve'\n" +
+                      "- Test with: 'ollama list'"
+        }
     
     try:
-        models_response = await asyncio.wait_for(ollama_client.list(), timeout=5.0)
+        models_response = await asyncio.wait_for(ollama_client.list(), timeout=10.0)
         
-        # Handle Ollama's custom response type
+        # Handle Ollama's custom ListResponse type
         if hasattr(models_response, 'models'):
             models_list = models_response.models
         else:
-            # Fallback to dict-like access
-            models_list = getattr(models_response, 'get', lambda k, default: default)('models', [])
+            models_list = []
         
         if not models_list:
-            return "No models found. Try 'ollama pull mistral' to download a model."
+            return {
+                "status": "warning",
+                "message": "❌ No models found. Download a model first:\n" +
+                          "Example: ollama pull mistral\n" +
+                          "Or: ollama pull llama3.2"
+            }
         
-        # Extract model names
-        model_names = []
+        # Extract model names and details
+        available_models = []
         for model in models_list:
             if hasattr(model, 'name'):
-                model_names.append(model.name)
-            elif hasattr(model, 'model'):
-                model_names.append(model.model)
-            elif isinstance(model, dict):
-                model_names.append(model.get('name', model.get('model', str(model))))
+                available_models.append({
+                    "name": model.name,
+                    "size": getattr(model, 'size', 'Unknown'),
+                    "modified": str(getattr(model, 'modified_at', 'Unknown'))
+                })
             else:
-                model_names.append(str(model))
+                available_models.append({"name": str(model), "size": "Unknown"})
         
-        if model_names:
-            return f"Available models: {', '.join(model_names)}"
-        else:
-            return f"Models found but could not extract names. Count: {len(models_list)}"
+        return {
+            "status": "success",
+            "models": available_models,
+            "count": len(available_models),
+            "message": f"📋 Found {len(available_models)} available models"
+        }
             
     except asyncio.TimeoutError:
-        return "ERROR: Timeout connecting to Ollama"
+        return {
+            "status": "error",
+            "message": "⏱️ ERROR: Timeout connecting to Ollama service (>10s)"
+        }
     except Exception as e:
-        return f"ERROR: {type(e).__name__}: {str(e)}"
+        return {
+            "status": "error", 
+            "message": f"❌ ERROR: {type(e).__name__}: {str(e)}"
+        }
 
 @mcp.tool(
     name="base_chat",
-    description="Chat with a base LLM model"
+    description="Chat with a base LLM model (left-side bot for comparison platform). Supports streaming responses."
 )
-async def base_chat(user_message: str, model_name: str = "mistral"):
-    """Chat with base LLM without document context"""
+async def base_chat(user_message: str, model_name: str = None, stream: bool = True, max_tokens: int = 1000):
+    """
+    Enhanced chat function with streaming support for Task 2 - Phase 1
+    This powers the left-side (base) chatbot in the dual comparison interface.
+    """
     
-    # Check if Ollama is available
-    if not ollama_available:
-        if not await check_ollama():
-            return "ERROR: Ollama not available. Please start Ollama service first."
-    
-    # Validate inputs
     if not user_message or not user_message.strip():
-        return "ERROR: Please provide a message"
+        return {
+            "status": "error",
+            "message": "❌ ERROR: No message provided"
+        }
+    
+    # Use default model if none specified
+    if not model_name:
+        model_name = default_model
+    
+    if not await ensure_ollama_available():
+        return {
+            "status": "error",
+            "message": "❌ ERROR: Ollama not available. Please start Ollama service first."
+        }
     
     try:
-        # Collect response parts
-        response_parts = []
+        # Prepare the chat parameters
+        chat_params = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": user_message.strip()}],
+            "stream": stream
+        }
         
-        # Stream response from Ollama
-        stream = await asyncio.wait_for(
-            ollama_client.chat(
-                model=model_name,
-                messages=[{'role': 'user', 'content': user_message.strip()}],
-                stream=True
-            ),
-            timeout=5.0  # Timeout for getting the stream
-        )
+        if stream:
+            # Streaming response - collect all chunks
+            response_chunks = []
+            full_response = ""
+            
+            # The ollama client.chat() with stream=True returns an async generator directly
+            async for chunk in ollama_client.chat(**chat_params):
+                if isinstance(chunk, dict) and 'message' in chunk:
+                    content = chunk['message'].get('content', '')
+                elif hasattr(chunk, 'message') and hasattr(chunk.message, 'content'):
+                    content = chunk.message.content
+                else:
+                    content = ""
+                    
+                if content:
+                    response_chunks.append(content)
+                    full_response += content
+            
+            if not full_response:
+                return {
+                    "status": "warning",
+                    "message": "⚠️ Model responded but with empty content",
+                    "model_used": model_name
+                }
+            
+            return {
+                "status": "success",
+                "response": full_response,
+                "model_used": model_name,
+                "streaming": True,
+                "chunks_received": len(response_chunks),
+                "message": f"✅ Streaming response completed from {model_name}"
+            }
         
-        # Process stream with overall timeout
-        async def process_stream():
-            async for chunk in stream:
-                if chunk.get('message', {}).get('content'):
-                    response_parts.append(chunk['message']['content'])
-                if chunk.get('done', False):
-                    break
-            return ''.join(response_parts)
-        
-        result = await asyncio.wait_for(process_stream(), timeout=25.0)
-        
-        if not result:
-            return "No response generated from model"
-        
-        return result
+        else:
+            # Non-streaming response
+            response = await asyncio.wait_for(
+                ollama_client.chat(**chat_params),
+                timeout=30.0
+            )
+            
+            # Extract response content
+            if hasattr(response, 'message') and hasattr(response.message, 'content'):
+                content = response.message.content
+                if content:
+                    return {
+                        "status": "success",
+                        "response": content,
+                        "model_used": model_name,
+                        "streaming": False,
+                        "message": f"✅ Response received from {model_name}"
+                    }
+            
+            return {
+                "status": "error",
+                "message": f"❌ Could not parse response from {model_name}",
+                "model_used": model_name
+            }
         
     except asyncio.TimeoutError:
-        return f"ERROR: Timeout - model '{model_name}' took too long to respond"
-    except ollama.ResponseError as e:
-        if "not found" in str(e).lower():
-            return f"ERROR: Model '{model_name}' not found. Try: ollama pull {model_name}"
-        return f"ERROR: Ollama error - {str(e)}"
+        return {
+            "status": "error",
+            "message": f"⏱️ TIMEOUT: {model_name} took >30s to respond - too slow for real-time chat",
+            "model_used": model_name
+        }
     except Exception as e:
-        return f"ERROR: {type(e).__name__} - {str(e)}"
+        error_msg = str(e)
+        if "model" in error_msg.lower() and "not found" in error_msg.lower():
+            return {
+                "status": "error",
+                "message": f"❌ Model '{model_name}' not found. Available models: Use 'list_models' tool to see options.",
+                "model_used": model_name
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"❌ Chat error with {model_name}: {error_msg}",
+                "model_used": model_name
+            }
 
-# Run the server
-if __name__ == "__main__":
-    # Initialize Ollama check on startup
-    asyncio.create_task(check_ollama())
+@mcp.tool(
+    name="debug_chat",
+    description="Debug version of chat to see raw Ollama response structure"
+)
+async def debug_chat(user_message: str, model_name: str = None):
+    """Debug chat to inspect the actual response structure from Ollama"""
     
-    # Run MCP server
-    mcp.run(transport='stdio')
+    if not user_message:
+        return {"status": "error", "message": "No message provided"}
+    
+    if not model_name:
+        model_name = default_model
+    
+    if not await ensure_ollama_available():
+        return {"status": "error", "message": "Ollama not available"}
+    
+    try:
+        # Try non-streaming first to see the structure
+        response = await asyncio.wait_for(
+            ollama_client.chat(
+                model=model_name,
+                messages=[{"role": "user", "content": user_message}],
+                stream=False
+            ),
+            timeout=15.0
+        )
+        
+        # Debug: Show what we actually get
+        response_info = {
+            "response_type": str(type(response)),
+            "response_dir": [attr for attr in dir(response) if not attr.startswith('_')],
+            "raw_response": str(response)[:500]  # First 500 chars
+        }
+        
+        # Try to extract content
+        if hasattr(response, 'message'):
+            message_info = {
+                "message_type": str(type(response.message)),
+                "message_dir": [attr for attr in dir(response.message) if not attr.startswith('_')],
+                "message_content": getattr(response.message, 'content', 'NO CONTENT ATTR')
+            }
+            response_info["message_info"] = message_info
+        
+        return {
+            "status": "debug_success",
+            "debug_info": response_info,
+            "user_message": user_message,
+            "model_used": model_name
+        }
+        
+    except Exception as e:
+        return {
+            "status": "debug_error",
+            "error": str(e),
+            "error_type": str(type(e)),
+            "user_message": user_message,
+            "model_used": model_name
+        }
+    description="Stream chat responses in real-time (simulated streaming for MCP testing)"
+
+async def stream_chat(user_message: str, model_name: str = None):
+    """
+    Simulated streaming function to test streaming capabilities
+    In real implementation, this would yield chunks as they arrive
+    """
+    
+    if not user_message:
+        return {"status": "error", "message": "No message provided"}
+    
+    if not model_name:
+        model_name = default_model
+    
+    if not await ensure_ollama_available():
+        return {"status": "error", "message": "Ollama not available"}
+    
+    try:
+        # Simulate streaming by breaking response into chunks
+        response_data = await base_chat(user_message, model_name, stream=True)
+        
+        if response_data.get("status") == "success":
+            full_response = response_data.get("response", "")
+            
+            # Simulate chunk streaming for demonstration
+            words = full_response.split()
+            chunks = []
+            current_chunk = ""
+            
+            for i, word in enumerate(words):
+                current_chunk += word + " "
+                if len(current_chunk) > 50 or i == len(words) - 1:  # Chunk every ~50 chars
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+            
+            return {
+                "status": "success",
+                "message": "✅ Streaming simulation completed",
+                "model_used": model_name,
+                "total_chunks": len(chunks),
+                "chunks": chunks,
+                "full_response": full_response
+            }
+        else:
+            return response_data
+            
+    except Exception as e:
+        return {"status": "error", "message": f"Streaming error: {e}"}
+
+@mcp.tool(
+    name="quick_test",
+    description="Ultra-fast test of Ollama without actual chat"
+)
+async def quick_test():
+    """Test Ollama connectivity without doing actual chat"""
+    try:
+        if not ollama_available:
+            status = await check_ollama()
+            if not status:
+                return "❌ Ollama not available - service not running"
+        
+        # Just test if we can reach Ollama quickly
+        models = await asyncio.wait_for(ollama_client.list(), timeout=3.0)
+        model_count = len(models.models) if hasattr(models, 'models') else 0
+        
+        return f"✅ Ollama responsive - {model_count} models available"
+        
+    except asyncio.TimeoutError:
+        return "❌ Ollama too slow (>3s) - may be overloaded"
+    except Exception as e:
+        return f"❌ Connection error: {e}"
+
+@mcp.tool(
+    name="set_default_model",
+    description="Set the default model for chat operations"
+)
+async def set_default_model(model_name: str):
+    """Set the default model to use for chat operations"""
+    global default_model
+    
+    # Verify the model exists
+    models_result = await list_models()
+    if models_result.get("status") == "success":
+        available_models = [m["name"] for m in models_result.get("models", [])]
+        if model_name in available_models:
+            default_model = model_name
+            return {
+                "status": "success",
+                "message": f"✅ Default model set to: {model_name}",
+                "previous_default": default_model
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"❌ Model '{model_name}' not found. Available: {', '.join(available_models)}"
+            }
+    else:
+        return {
+            "status": "error", 
+            "message": "❌ Cannot verify model - Ollama connection issue"
+        }
+
+# Server startup with enhanced initialization
+async def initialize_server():
+    """Initialize server and check Ollama connectivity"""
+    print("🚀 Starting MCP Server for Dual Chatbot Platform...")
+    print("📊 Task 2 - Phase 1: Base LLM Integration with Streaming")
+    print("🔧 Features: Enhanced base_chat tool, model selection, streaming responses")
+    
+    # Initialize Ollama connection
+    print("🔍 Checking Ollama connectivity...")
+    if await check_ollama():
+        print("✅ Ollama connection successful!")
+        
+        # Try to list models to give user feedback
+        models_result = await list_models()
+        if models_result.get("status") == "success":
+            print(f"📋 Found {models_result.get('count', 0)} available models")
+        else:
+            print("⚠️ Ollama connected but no models found - you may need to download models")
+    else:
+        print("❌ Ollama connection failed - server will still start but chat functions will be limited")
+        print("💡 To fix: Ensure Ollama is running ('ollama serve' or start Ollama desktop app)")
+
+if __name__ == "__main__":
+    try:
+        # Run initialization
+        asyncio.run(initialize_server())
+        
+        # Run the MCP server
+        mcp.run(transport='stdio')
+        
+    except KeyboardInterrupt:
+        print("\n🛑 MCP Server shutting down...")
+    except Exception as e:
+        print(f"❌ Server error: {e}")
+        logger.error(f"Server error: {e}")
