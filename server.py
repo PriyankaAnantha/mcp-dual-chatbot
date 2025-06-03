@@ -156,18 +156,35 @@ async def base_chat(user_message: str, model_name: str = None, stream: bool = Tr
             response_chunks = []
             full_response = ""
             
-            # The ollama client.chat() with stream=True returns an async generator directly
-            async for chunk in ollama_client.chat(**chat_params):
-                if isinstance(chunk, dict) and 'message' in chunk:
-                    content = chunk['message'].get('content', '')
-                elif hasattr(chunk, 'message') and hasattr(chunk.message, 'content'):
-                    content = chunk.message.content
-                else:
-                    content = ""
-                    
-                if content:
-                    response_chunks.append(content)
-                    full_response += content
+            # Add longer timeout for streaming to handle model loading
+            try:
+                # The ollama client.chat() with stream=True returns an async generator directly
+                stream_gen = ollama_client.chat(**chat_params)
+                
+                # Add timeout wrapper for the entire streaming process
+                async def stream_with_timeout():
+                    async for chunk in stream_gen:
+                        if isinstance(chunk, dict) and 'message' in chunk:
+                            content = chunk['message'].get('content', '')
+                        elif hasattr(chunk, 'message') and hasattr(chunk.message, 'content'):
+                            content = chunk.message.content
+                        else:
+                            content = ""
+                            
+                        if content:
+                            response_chunks.append(content)
+                            full_response += content
+                
+                # Give streaming more time for initial model load
+                await asyncio.wait_for(stream_with_timeout(), timeout=60.0)
+                
+            except asyncio.TimeoutError:
+                return {
+                    "status": "error",
+                    "message": f"⏱️ STREAMING TIMEOUT: {model_name} took >60s - model may be loading for first time",
+                    "model_used": model_name,
+                    "suggestion": "Try 'preload_model' tool first, or use a smaller model"
+                }
             
             if not full_response:
                 return {
@@ -186,10 +203,10 @@ async def base_chat(user_message: str, model_name: str = None, stream: bool = Tr
             }
         
         else:
-            # Non-streaming response
+            # Non-streaming response with longer timeout for model loading
             response = await asyncio.wait_for(
                 ollama_client.chat(**chat_params),
-                timeout=30.0
+                timeout=60.0  # Increased from 30s to 60s
             )
             
             # Extract response content
@@ -235,11 +252,11 @@ async def base_chat(user_message: str, model_name: str = None, stream: bool = Tr
     name="debug_chat",
     description="Debug version of chat to see raw Ollama response structure"
 )
-async def debug_chat(user_message: str, model_name: str = None):
+async def debug_chat(user_message: str = "Hi", model_name: str = None):
     """Debug chat to inspect the actual response structure from Ollama"""
     
     if not user_message:
-        return {"status": "error", "message": "No message provided"}
+        user_message = "Hi"  # Default simple message
     
     if not model_name:
         model_name = default_model
@@ -248,14 +265,14 @@ async def debug_chat(user_message: str, model_name: str = None):
         return {"status": "error", "message": "Ollama not available"}
     
     try:
-        # Try non-streaming first to see the structure
+        # Very short timeout for debugging
         response = await asyncio.wait_for(
             ollama_client.chat(
                 model=model_name,
                 messages=[{"role": "user", "content": user_message}],
                 stream=False
             ),
-            timeout=15.0
+            timeout=5.0  # Much shorter timeout
         )
         
         # Debug: Show what we actually get
@@ -281,6 +298,14 @@ async def debug_chat(user_message: str, model_name: str = None):
             "model_used": model_name
         }
         
+    except asyncio.TimeoutError:
+        return {
+            "status": "timeout_error",
+            "message": f"❌ Ollama timeout after 5s with model {model_name}",
+            "suggestion": "Model may be slow to load. Try: ollama run mistral (to preload)",
+            "user_message": user_message,
+            "model_used": model_name
+        }
     except Exception as e:
         return {
             "status": "debug_error",
@@ -339,9 +364,66 @@ async def stream_chat(user_message: str, model_name: str = None):
         return {"status": "error", "message": f"Streaming error: {e}"}
 
 @mcp.tool(
-    name="quick_test",
-    description="Ultra-fast test of Ollama without actual chat"
+    name="simple_test",
+    description="Extremely simple Ollama test without complex chat logic"
 )
+async def simple_test():
+    """Simplest possible test to isolate the issue"""
+    
+    try:
+        # Test 1: Check if client exists
+        if not ollama_client:
+            return "❌ No Ollama client"
+        
+        # Test 2: Try to list models (this worked before)
+        models = await asyncio.wait_for(ollama_client.list(), timeout=3.0)
+        model_count = len(models.models) if hasattr(models, 'models') else 0
+        
+        # Test 3: Try simplest possible chat call
+        try:
+            response = await asyncio.wait_for(
+                ollama_client.chat(
+                    model="mistral",  # Use explicit model name
+                    messages=[{"role": "user", "content": "Say hi"}],
+                    stream=False
+                ),
+                timeout=8.0
+            )
+            
+            # Just check if we got anything back
+            response_type = str(type(response))
+            has_message = hasattr(response, 'message')
+            
+            return {
+                "status": "success",
+                "models_available": model_count,
+                "chat_response_type": response_type,
+                "has_message_attr": has_message,
+                "message": "✅ Basic chat call succeeded!"
+            }
+            
+        except asyncio.TimeoutError:
+            return {
+                "status": "chat_timeout",
+                "models_available": model_count,
+                "message": "❌ Chat timed out but model listing works"
+            }
+        except Exception as chat_error:
+            return {
+                "status": "chat_error", 
+                "models_available": model_count,
+                "chat_error": str(chat_error),
+                "message": "❌ Chat failed but model listing works"
+            }
+        
+    except Exception as e:
+        return {
+            "status": "connection_error",
+            "error": str(e),
+            "message": "❌ Basic Ollama connection failed"
+        }
+    description="Ultra-fast test of Ollama without actual chat"
+
 async def quick_test():
     """Test Ollama connectivity without doing actual chat"""
     try:
@@ -362,9 +444,118 @@ async def quick_test():
         return f"❌ Connection error: {e}"
 
 @mcp.tool(
-    name="set_default_model",
-    description="Set the default model for chat operations"
+    name="check_model_status",
+    description="Check if a model is loaded and ready for chat"
 )
+async def check_model_status(model_name: str = None):
+    """Check if a specific model is loaded and responsive"""
+    
+    if not model_name:
+        model_name = default_model
+    
+    if not await ensure_ollama_available():
+        return {"status": "error", "message": "Ollama not available"}
+    
+    try:
+        # Check if model exists in list
+        models_result = await list_models()
+        if models_result.get("status") != "success":
+            return {"status": "error", "message": "Cannot check model list"}
+        
+        available_models = [m["name"] for m in models_result.get("models", [])]
+        if model_name not in available_models:
+            return {
+                "status": "not_found",
+                "message": f"❌ Model '{model_name}' not found",
+                "available_models": available_models
+            }
+        
+        # Try a very quick chat to see if it's loaded
+        import time
+        start_time = time.time()
+        
+        try:
+            response = await asyncio.wait_for(
+                ollama_client.chat(
+                    model=model_name,
+                    messages=[{"role": "user", "content": "1"}],  # Minimal input
+                    stream=False
+                ),
+                timeout=5.0  # Very short timeout
+            )
+            
+            response_time = time.time() - start_time
+            
+            return {
+                "status": "loaded",
+                "message": f"✅ Model '{model_name}' is loaded and ready",
+                "model_name": model_name,
+                "response_time_seconds": round(response_time, 2),
+                "ready_for_chat": True
+            }
+            
+        except asyncio.TimeoutError:
+            return {
+                "status": "loading",
+                "message": f"⏳ Model '{model_name}' exists but is slow to respond (>5s)",
+                "model_name": model_name,
+                "suggestion": "Model may be loading into memory. Wait a moment and try again.",
+                "ready_for_chat": False
+            }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"❌ Error checking model status: {str(e)}",
+            "model_name": model_name
+        }
+    description="Preload a model to avoid timeout issues during chat"
+
+async def preload_model(model_name: str = None):
+    """Preload a model by sending it a simple request to wake it up"""
+    
+    if not model_name:
+        model_name = default_model
+    
+    if not await ensure_ollama_available():
+        return {"status": "error", "message": "Ollama not available"}
+    
+    try:
+        # Send a very simple message to preload the model
+        print(f"🔄 Preloading model {model_name}...")
+        
+        response = await asyncio.wait_for(
+            ollama_client.chat(
+                model=model_name,
+                messages=[{"role": "user", "content": "Hi"}],
+                stream=False
+            ),
+            timeout=30.0  # Longer timeout for initial load
+        )
+        
+        return {
+            "status": "success",
+            "message": f"✅ Model {model_name} preloaded successfully",
+            "model_name": model_name,
+            "response_received": True
+        }
+        
+    except asyncio.TimeoutError:
+        return {
+            "status": "timeout",
+            "message": f"⏱️ Model {model_name} took >30s to load - may be too large for system",
+            "model_name": model_name,
+            "suggestion": "Try a smaller model like 'mistral:7b' or check system resources"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"❌ Failed to preload {model_name}: {str(e)}",
+            "model_name": model_name,
+            "error_type": str(type(e))
+        }
+    description="Set the default model for chat operations"
+
 async def set_default_model(model_name: str):
     """Set the default model to use for chat operations"""
     global default_model
